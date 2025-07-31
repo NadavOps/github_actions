@@ -1,0 +1,64 @@
+name: Generate github app token
+description: Generate github app token
+
+inputs:
+  github_app_id:
+    description: The github app id
+    required: true
+  github_app_installation_id:
+    description: The github app installation id
+    required: true
+  github_app_private_key:
+    description: The github app private key
+    required: true
+  repo_name_for_token_authorization:
+    description: Repo name to get the token for
+    required: true
+
+outputs:
+  short_lived_access_token:
+    description: "Short lived access token"
+    value: ${{ steps.generate_short_lived_access_token_token.outputs.short_lived_access_token }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Generate short lived access token token
+      id: generate_short_lived_access_token_token
+      shell: bash
+      run: |
+        GITHUB_APP_ID="${{ inputs.github_app_id }}"
+        GITHUB_APP_INSTALLATION_ID="${{ inputs.github_app_installation_id }}"
+        GITHUB_APP_PRIVATE_KEY="${{ inputs.github_app_private_key }}"
+
+        b64enc() { openssl enc -base64 -A | tr '+/' '-_' | tr -d '='; }
+        json() { jq -c . | LC_CTYPE=C tr -d '\n'; }
+        rs_sign() { openssl dgst -binary -sha256 -sign <(printf '%s\n' "$1"); }
+
+        header='{ "typ": "JWT", "alg": "RS256" }'
+        payload="{ \"iss\": \"$GITHUB_APP_ID\" }"
+        payload=$(
+            echo "${payload}" | jq --arg time_str "$(date +%s)" \
+            '
+            ($time_str | tonumber) as $time_num
+            | .iat=$time_num - 15
+            | .exp=($time_num + 5)
+            '
+        )
+
+        signed_content="$(json <<<"$header" | b64enc).$(json <<<"$payload" | b64enc)"
+        sig=$(printf %s "$signed_content" | rs_sign "$GITHUB_APP_PRIVATE_KEY" | b64enc)
+
+        jwt="${signed_content}.${sig}"
+
+        # tokens are good for 1 hour: https://docs.github.com/en/rest/apps/apps?apiVersion=2022-11-28
+        raw=$(curl -s -X POST \
+            -H "Authorization: Bearer $jwt" \
+            -H "Accept: application/vnd.github+json" \
+            -d '{"repositories":["${{ inputs.repo_name_for_token_authorization }}"],"permissions":{"contents":"read"}}' \
+            https://api.github.com/app/installations/$GITHUB_APP_INSTALLATION_ID/access_tokens)
+
+        echo $raw | jq -r . | grep -v token
+        short_lived_access_token=$(echo $raw | jq -r ".token")
+
+        echo "short_lived_access_token=$short_lived_access_token" >> $GITHUB_OUTPUT
